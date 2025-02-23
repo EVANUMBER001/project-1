@@ -53,6 +53,7 @@ void userprog_init(void) {
    process id, or TID_ERROR if the thread cannot be created. */
 pid_t process_execute(const char* file_name) {
   char* fn_copy;
+  char* prog_name;
   tid_t tid;
 
   sema_init(&temporary, 0);
@@ -63,8 +64,12 @@ pid_t process_execute(const char* file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
+  /* Extract program name from FILE_NAME */
+  char* save_ptr;
+  prog_name = strtok_r(fn_copy, " ", &save_ptr);
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create(prog_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page(fn_copy);
   return tid;
@@ -77,6 +82,7 @@ static void start_process(void* file_name_) {
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
+  char* save_ptr;  // Declare save_ptr here
 
   /* Retrieve process control block */
   struct process* new_pcb = calloc(sizeof(struct process), 1);
@@ -100,13 +106,17 @@ static void start_process(void* file_name_) {
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
-    success = load(file_name, &if_.eip, &if_.esp);
+
+    // Extract the program name from the command line
+    char* prog_name = strtok_r(file_name, " ", &save_ptr);
+
+    success = load(prog_name, &if_.eip, &if_.esp);
   }
 
-  /* Handle failure with succesful PCB malloc. Must free the PCB */
+  /* Handle failure with successful PCB malloc. Must free the PCB */
   if (!success && pcb_success) {
     // Avoid race where PCB is freed before t->pcb is set to NULL
-    // If this happens, then an unfortuantely timed timer interrupt
+    // If this happens, then an unfortunately timed timer interrupt
     // can try to activate the pagedir, but it is now freed memory
     struct process* pcb_to_free = t->pcb;
     t->pcb = NULL;
@@ -118,6 +128,53 @@ static void start_process(void* file_name_) {
   if (!success) {
     sema_up(&temporary);
     thread_exit();
+  }
+
+  // Set up the stack with arguments
+  if (success) {
+    char* argv[128];
+    int argc = 0;
+
+    // Tokenize the command line arguments
+    for (char* token = strtok_r(NULL, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
+      argv[argc++] = token;
+    }
+
+    // Push arguments onto the stack in reverse order
+    void* esp = if_.esp;
+    for (int i = argc - 1; i >= 0; i--) {
+      esp -= strlen(argv[i]) + 1;
+      memcpy(esp, argv[i], strlen(argv[i]) + 1);
+      argv[i] = esp;
+    }
+
+    // Word-align the stack pointer
+    esp = (void*)((uintptr_t)esp & ~0x3);
+
+    // Push null pointer sentinel
+    esp -= sizeof(char*);
+    *(char**)esp = NULL;
+
+    // Push addresses of arguments
+    for (int i = argc - 1; i >= 0; i--) {
+      esp -= sizeof(char*);
+      *(char**)esp = argv[i];
+    }
+
+    // Push argv
+    char** argv_ptr = esp;
+    esp -= sizeof(char**);
+    *(char***)esp = argv_ptr;
+
+    // Push argc
+    esp -= sizeof(int);
+    *(int*)esp = argc;
+
+    // Push fake return address
+    esp -= sizeof(void*);
+    *(void**)esp = NULL;
+
+    if_.esp = esp;
   }
 
   /* Start the user process by simulating a return from an
